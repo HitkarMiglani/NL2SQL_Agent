@@ -34,6 +34,35 @@ STATUS_MESSAGES = {
 }
 
 FORBIDDEN_SQL_PATTERN = re.compile(r"\b(drop|delete|update|insert)\b", re.IGNORECASE)
+SQL_OVERRIDE_START_PATTERN = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+SQL_OVERRIDE_FORBIDDEN_PATTERN = re.compile(
+    r"\b(attach|detach|pragma|alter|create|drop|update|insert|delete|replace|vacuum|reindex|analyze|truncate)\b",
+    re.IGNORECASE,
+)
+SQL_STRING_LITERAL_PATTERN = re.compile(r"'(?:''|[^'])*'")
+
+
+def _sanitize_sql_override(sql_query: str) -> str:
+    cleaned = sql_query.strip()
+    if not cleaned:
+        raise ValueError("SQL override is empty")
+    if not SQL_OVERRIDE_START_PATTERN.match(cleaned):
+        raise ValueError("SQL override must start with SELECT or WITH")
+
+    without_literals = SQL_STRING_LITERAL_PATTERN.sub("''", cleaned)
+    if SQL_OVERRIDE_FORBIDDEN_PATTERN.search(without_literals):
+        raise ValueError("Forbidden SQL operation detected")
+    if "--" in without_literals or "/*" in without_literals:
+        raise ValueError("SQL comments are not allowed in overrides")
+
+    normalized = without_literals.strip()
+    if ";" in normalized:
+        if not normalized.endswith(";") or normalized.count(";") > 1:
+            raise ValueError("Multiple SQL statements are not allowed")
+        cleaned = cleaned.rstrip().rstrip(";")
+
+    return cleaned
+
 
 app = Flask(__name__, static_folder="web", static_url_path="/static")
 _assets_lock = threading.Lock()
@@ -89,16 +118,12 @@ def _read_only_uri(db_path: str) -> str:
 
 
 def _execute_sql_direct(db_path: str, sql_query: str) -> pd.DataFrame:
-    if not sql_query.strip():
-        raise ValueError("SQL override is empty")
-    if FORBIDDEN_SQL_PATTERN.search(sql_query):
-        raise ValueError("Forbidden SQL operation detected")
+    sql_query = _sanitize_sql_override(sql_query)
 
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(_read_only_uri(db_path), uri=True)
         return pd.read_sql_query(sql_query, connection)
-    
     finally:
         if connection is not None:
             connection.close()
@@ -344,7 +369,6 @@ def _classify_error(
         return {
             "error_type": "empty_result",
             "error_message": "No rows were returned for this query.",
-            "error_trace": error_trace or "Result set was empty.",
         }
 
     if status != "failed":
@@ -355,25 +379,21 @@ def _classify_error(
         return {
             "error_type": "db_timeout",
             "error_message": "Database connection timed out.",
-            "error_trace": error_trace or "Database timeout.",
         }
     if "generated sql is empty" in trace_text or "sql generation" in trace_text or "parse" in trace_text:
         return {
             "error_type": "llm_parse_error",
             "error_message": "The AI could not produce a valid SQL query.",
-            "error_trace": error_trace or "LLM output did not include valid SQL.",
         }
     if "sqlite" in trace_text or "no such" in trace_text or "syntax" in trace_text or "forbidden" in trace_text:
         return {
             "error_type": "sql_execution_failure",
             "error_message": "The SQL could not be executed on the database.",
-            "error_trace": error_trace or "SQL execution failed.",
         }
 
     return {
         "error_type": "unknown_error",
         "error_message": "Something went wrong while running the query.",
-        "error_trace": error_trace or "Unknown error.",
     }
 
 
@@ -459,10 +479,7 @@ def api_query_stream() -> Any:
     except (TypeError, ValueError):
         top_k = 3
 
-    raw_override = payload.get("sql_override")
     sql_override: str | None = None
-    if isinstance(raw_override, str):
-        sql_override = raw_override.strip() or None
 
     _ensure_assets_ready()
 
@@ -610,4 +627,4 @@ def static_files(filename: str) -> Any:
 
 if __name__ == "__main__":
     _ensure_assets_ready()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=False)

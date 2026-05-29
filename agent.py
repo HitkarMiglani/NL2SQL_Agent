@@ -416,6 +416,16 @@ def run_agent(
     llm_client: BaseLLMClient | None = None,
     top_k: int = 3,
 ) -> AgentState:
+    if llm_client is None:
+        llm_client = load_llm_client()
+
+    graph = build_agent_graph(
+        db_path=db_path,
+        collection_name=collection_name,
+        llm_client=llm_client,
+        top_k=top_k,
+    )
+
     initial_state: AgentState = {
         "query": question,
         "schema_context": "",
@@ -427,7 +437,7 @@ def run_agent(
         "status": "initialized",
     }
     final_state = graph.invoke(initial_state)
-    
+
     # Add confidence to the final output dictionary, separate from the graph state
     output = dict(final_state)
     output["schema_confidence"] = final_state.get("schema_confidence", 0.0)
