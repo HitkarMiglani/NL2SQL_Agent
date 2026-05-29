@@ -175,6 +175,4 @@ Server-Sent Events (SSE) endpoint that streams node updates and emits a final `d
 - **LLM errors:** Ensure the selected provider API key is set via `.env` or the UI.
 - **SQL blocked:** The system rejects write operations by design.
 
-## License
 
-This project is for academic and demonstration use. Add a license file if you plan to distribute it.
