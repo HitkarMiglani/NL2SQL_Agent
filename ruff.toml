@@ -1,0 +1,10 @@
+line-length = 120
+target-version = "py312"
+
+[lint]
+# Keep CI signal-focused: real bugs (F) and basic style (E) only, not full opinionated ruleset.
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+"tests/*" = ["F401"]

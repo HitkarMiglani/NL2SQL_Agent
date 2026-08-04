@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 from dotenv import load_dotenv
 
-from agent import load_llm_client, run_agent
-from retriever import build_index, extract_schema
-from setup_db import DB_PATH, create_database
+from .agent import load_llm_client, run_agent
+from .retriever import build_index, extract_schema
+from .setup_db import DB_PATH, create_database
 
 load_dotenv()
 

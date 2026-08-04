@@ -6,8 +6,9 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+from .config import settings
 
-DB_PATH = Path("data") / "enterprise.db"
+DB_PATH = settings.database_path
 SEED = 42
 
 
@@ -153,9 +154,9 @@ def _seed_departments(cursor: sqlite3.Cursor, location_ids: list[int]) -> list[i
         ("Customer Success", "CC-160", "2023-01-05"),
         ("Product", "CC-170", "2023-01-05"),
     ]
-    
+
     rows = [(d[0], random.choice(location_ids), d[1], d[2]) for d in departments]
-    
+
     cursor.executemany(
         "INSERT INTO departments (department_name, location_id, cost_center, created_at) VALUES (?, ?, ?, ?)",
         rows,

@@ -1,22 +1,23 @@
 from __future__ import annotations
 
-import logging
-import os
 import re
-import sqlite3
-from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict
 
 import pandas as pd
 from langgraph.graph import END, StateGraph
 
-from retriever import retrieve_relevant_schemas
-from visualizer import generate_plotly_chart, generate_summary, select_chart_type
+from . import db
+from .config import settings
+from .evaluation import judge_response
+from .logging_utils import get_logger
+from .retriever import retrieve_relevant_schemas
+from .tracing import configure_tracing, traceable
+from .utils import make_unique_columns
+from .visualizer import generate_plotly_chart, generate_summary, select_chart_type
 
 
-logger = logging.getLogger("AGENT")
-if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+logger = get_logger("AGENT")
+configure_tracing()
 
 FORBIDDEN_SQL_PATTERN = re.compile(r"\b(drop|delete|update|insert)\b", re.IGNORECASE)
 SQL_CLEANUP_PATTERN = re.compile(r"```(?:sql)?|```", re.IGNORECASE)
@@ -36,6 +37,7 @@ class AgentState(TypedDict):
     chart_type: NotRequired[str]
     summary: NotRequired[str]
     final_message: NotRequired[str]
+    judge_score: NotRequired[dict[str, Any] | None]
 
 
 class BaseLLMClient:
@@ -80,27 +82,12 @@ def _extract_sql_text(text: str) -> str:
     return cleaned
 
 
-def _make_unique_columns(columns: list[str]) -> list[str]:
-    seen: dict[str, int] = {}
-    unique_columns: list[str] = []
-
-    for column in columns:
-        count = seen.get(column, 0)
-        if count == 0:
-            unique_columns.append(column)
-        else:
-            unique_columns.append(f"{column}_{count + 1}")
-        seen[column] = count + 1
-
-    return unique_columns
-
-
 class GeminiLLMClient(BaseLLMClient):
     def __init__(self, api_key: str, model_name: str | None = None) -> None:
         from google import genai  # type: ignore
 
         self._client = genai.Client(api_key=api_key)
-        self._model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        self._model_name = model_name or settings.gemini_model
 
     def generate_text(self, prompt: str) -> str:
         response = self._client.models.generate_content(model=self._model_name, contents=prompt)
@@ -112,7 +99,7 @@ class GroqLLMClient(BaseLLMClient):
         from groq import Groq  # type: ignore
 
         self._client = Groq(api_key=api_key)
-        self._model_name = model_name or os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+        self._model_name = model_name or settings.groq_model
 
     def generate_text(self, prompt: str) -> str:
         response = self._client.chat.completions.create(
@@ -127,18 +114,18 @@ class GroqLLMClient(BaseLLMClient):
 
 
 def load_llm_client(provider: str | None = None, api_key: str | None = None) -> BaseLLMClient:
-    selected_provider = (provider or os.getenv("NL2SQL_LLM_PROVIDER", "gemini")).strip().lower()
+    selected_provider = (provider or settings.llm_provider).strip().lower()
 
     if selected_provider not in {"gemini", "groq"}:
         raise ValueError("NL2SQL_LLM_PROVIDER must be either 'gemini' or 'groq'")
 
     if selected_provider == "gemini":
-        selected_api_key = api_key or os.getenv("GEMINI_API_KEY")
+        selected_api_key = api_key or settings.gemini_api_key
         if not selected_api_key:
             raise RuntimeError("GEMINI_API_KEY is required when NL2SQL_LLM_PROVIDER=gemini")
         return GeminiLLMClient(api_key=selected_api_key)
 
-    selected_api_key = api_key or os.getenv("GROQ_API_KEY")
+    selected_api_key = api_key or settings.groq_api_key
     if not selected_api_key:
         raise RuntimeError("GROQ_API_KEY is required when NL2SQL_LLM_PROVIDER=groq")
     return GroqLLMClient(api_key=selected_api_key)
@@ -150,10 +137,6 @@ def _extract_section(text: str, heading: str) -> str:
     if not match:
         return ""
     return match.group(1).strip()
-
-
-def _read_only_uri(db_path: str) -> str:
-    return f"{Path(db_path).resolve().as_uri()}?mode=ro"
 
 
 def _sanitize_sql(sql_text: str) -> str:
@@ -207,15 +190,9 @@ def _build_fallback_prompt(query: str) -> str:
 
 
 def _execute_sql_read_only(db_path: str, sql_query: str) -> pd.DataFrame:
-    connection: sqlite3.Connection | None = None
-    try:
-        connection = sqlite3.connect(_read_only_uri(db_path), uri=True)
-        result_df = pd.read_sql_query(sql_query, connection)
-        result_df.columns = _make_unique_columns([str(column) for column in result_df.columns])
-        return result_df
-    finally:
-        if connection is not None:
-            connection.close()
+    result_df = db.read_sql_query(sql_query, db_path)
+    result_df.columns = make_unique_columns([str(column) for column in result_df.columns])
+    return result_df
 
 
 def _log_transition(node_name: str, state: AgentState, outcome: str) -> None:
@@ -233,8 +210,10 @@ def build_agent_graph(
     collection_name: str,
     llm_client: BaseLLMClient,
     top_k: int = 3,
-    confidence_threshold: float = 0.5,
+    confidence_threshold: float = settings.schema_confidence_threshold,
+    max_retries: int = settings.max_retry_count,
 ) -> Any:
+    @traceable(name="retrieve_schema", run_type="retriever")
     def retrieve_schema(state: AgentState) -> dict[str, Any]:
         logger.info("[RETRIEVE_SCHEMA] Starting schema retrieval")
         try:
@@ -259,6 +238,7 @@ def build_agent_graph(
             return "generate_sql"
         return "fallback_message"
 
+    @traceable(name="generate_sql", run_type="llm")
     def generate_sql(state: AgentState) -> dict[str, Any]:
         logger.info("[GENERATE_SQL] Generating SQL")
         try:
@@ -270,6 +250,7 @@ def build_agent_graph(
             logger.error("[GENERATE_SQL] %s", exc)
             return {"error_trace": str(exc), "status": "sql_generation_failed"}
 
+    @traceable(name="execute_sql", run_type="tool")
     def execute_sql(state: AgentState) -> dict[str, Any]:
         logger.info("[EXECUTE_SQL] Executing SQL")
         try:
@@ -293,13 +274,14 @@ def build_agent_graph(
     def route_after_execution(state: AgentState) -> Literal["generate_visual_and_summary", "self_correct", "graceful_failure"]:
         if state.get("db_result") is not None:
             return "generate_visual_and_summary"
-        if state.get("retry_count", 0) >= 3:
+        if state.get("retry_count", 0) >= max_retries:
             return "graceful_failure"
         return "self_correct"
 
+    @traceable(name="self_correct", run_type="llm")
     def self_correct(state: AgentState) -> dict[str, Any]:
         current_retry = int(state.get("retry_count", 0))
-        logger.info("[SELF_CORRECT] Attempt %d/3", current_retry + 1)
+        logger.info("[SELF_CORRECT] Attempt %d/%d", current_retry + 1, max_retries)
         try:
             prompt = _build_correction_prompt(
                 query=state["query"],
@@ -322,6 +304,7 @@ def build_agent_graph(
                 "status": f"self_correction_failed_{current_retry + 1}",
             }
 
+    @traceable(name="generate_visual_and_summary", run_type="chain")
     def generate_visual_and_summary(state: AgentState) -> dict[str, Any]:
         logger.info("[GENERATE_VISUAL_AND_SUMMARY] Preparing output")
         try:
@@ -343,6 +326,20 @@ def build_agent_graph(
             logger.error("[GENERATE_VISUAL_AND_SUMMARY] %s", exc)
             return {"error_trace": str(exc), "status": "output_generation_failed"}
 
+    def judge_result(state: AgentState) -> dict[str, Any]:
+        logger.info("[JUDGE_RESULT] Scoring response quality")
+        if not settings.enable_llm_judge:
+            return {"judge_score": None}
+        score = judge_response(
+            question=state["query"],
+            sql_query=state.get("sql_query", ""),
+            db_result=state.get("db_result"),
+            summary=state.get("summary") or "",
+            llm_client=llm_client,
+        )
+        _log_transition("JUDGE_RESULT", state, "success" if score else "skipped")
+        return {"judge_score": score}
+
     def graceful_failure(state: AgentState) -> dict[str, Any]:
         logger.info("[GRACEFUL_FAILURE] Returning friendly failure message")
         _log_transition("GRACEFUL_FAILURE", state, "failure")
@@ -354,6 +351,7 @@ def build_agent_graph(
             "status": "failed",
         }
 
+    @traceable(name="fallback_message", run_type="llm")
     def fallback_message(state: AgentState) -> dict[str, Any]:
         """Generate a message when the query doesn't match the context."""
         logger.info("[FALLBACK_MESSAGE] Query does not match context, generating fallback.")
@@ -381,6 +379,7 @@ def build_agent_graph(
     workflow.add_node("evaluate_result", evaluate_result)
     workflow.add_node("self_correct", self_correct)
     workflow.add_node("generate_visual_and_summary", generate_visual_and_summary)
+    workflow.add_node("judge_result", judge_result)
     workflow.add_node("graceful_failure", graceful_failure)
     workflow.add_node("fallback_message", fallback_message)
 
@@ -402,7 +401,8 @@ def build_agent_graph(
         },
     )
     workflow.add_edge("self_correct", "execute_sql")
-    workflow.add_edge("generate_visual_and_summary", END)
+    workflow.add_edge("generate_visual_and_summary", "judge_result")
+    workflow.add_edge("judge_result", END)
     workflow.add_edge("graceful_failure", END)
     workflow.add_edge("fallback_message", END)
 

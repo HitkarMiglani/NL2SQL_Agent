@@ -3,33 +3,40 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import json
-import os
 import re
-import sqlite3
 import threading
 import time
 
 import pandas as pd
 import plotly.io as pio
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
+from flask import Flask, Response, g, jsonify, request, send_from_directory, stream_with_context
 
-from agent import build_agent_graph, load_llm_client
-from retriever import build_index, extract_schema
-from setup_db import DB_PATH, create_database
-from visualizer import generate_plotly_chart, generate_summary, select_chart_type
+from . import db
+from .agent import build_agent_graph, load_llm_client
+from .config import settings
+from .errors import ValidationError, register_error_handlers
+from .evaluation import judge_response
+from .logging_utils import get_logger, get_request_id, set_request_id
+from .retriever import build_index, extract_schema
+from .setup_db import DB_PATH, create_database
+from .utils import make_unique_columns
+from .visualizer import generate_plotly_chart, generate_summary, select_chart_type
 
 
 load_dotenv()
 
+logger = get_logger("APP")
+
 APP_TITLE = "NL2SQL Studio"
-DEFAULT_COLLECTION_NAME = "enterprise_schema_demo"
+DEFAULT_COLLECTION_NAME = settings.collection_name
 STATUS_MESSAGES = {
     "retrieve_schema": "Retrieving relevant schemas...",
     "generate_sql": "Generating SQL query...",
     "execute_sql": "Executing SQL...",
     "self_correct": "Error detected. Self-correcting...",
     "generate_visual_and_summary": "Query successful. Generating output...",
+    "judge_result": "Scoring response quality...",
     "graceful_failure": "Maximum retries reached. Could not generate a valid query.",
 }
 
@@ -65,8 +72,29 @@ def _sanitize_sql_override(sql_query: str) -> str:
 
 
 app = Flask(__name__, static_folder="web", static_url_path="/static")
+register_error_handlers(app)
 _assets_lock = threading.Lock()
 _assets_ready = False
+
+
+@app.before_request
+def _assign_request_id() -> None:
+    g.request_id = set_request_id(request.headers.get("X-Request-ID"))
+    g.request_start = time.perf_counter()
+
+
+@app.after_request
+def _log_request(response: Any) -> Any:
+    response.headers["X-Request-ID"] = get_request_id()
+    duration_ms = round((time.perf_counter() - g.get("request_start", time.perf_counter())) * 1000, 1)
+    logger.info(
+        "%s %s -> %s (%.1fms)",
+        request.method,
+        request.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
 
 
 def prepare_demo_assets(db_path: str, collection_name: str) -> None:
@@ -89,44 +117,18 @@ def _ensure_assets_ready() -> None:
         _assets_ready = True
 
 
-def _make_unique_columns(columns: list[str]) -> list[str]:
-    seen: dict[str, int] = {}
-    unique_columns: list[str] = []
-
-    for column in columns:
-        count = seen.get(column, 0)
-        if count == 0:
-            unique_columns.append(column)
-        else:
-            unique_columns.append(f"{column}_{count + 1}")
-        seen[column] = count + 1
-
-    return unique_columns
-
-
 def _normalize_dataframe_for_display(df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None:
         return None
 
     normalized_df = df.copy()
-    normalized_df.columns = _make_unique_columns([str(column) for column in normalized_df.columns])
+    normalized_df.columns = make_unique_columns([str(column) for column in normalized_df.columns])
     return normalized_df
-
-
-def _read_only_uri(db_path: str) -> str:
-    return f"{Path(db_path).resolve().as_uri()}?mode=ro"
 
 
 def _execute_sql_direct(db_path: str, sql_query: str) -> pd.DataFrame:
     sql_query = _sanitize_sql_override(sql_query)
-
-    connection: sqlite3.Connection | None = None
-    try:
-        connection = sqlite3.connect(_read_only_uri(db_path), uri=True)
-        return pd.read_sql_query(sql_query, connection)
-    finally:
-        if connection is not None:
-            connection.close()
+    return db.read_sql_query(sql_query, db_path)
 
 
 # --- Prompt Guardrails ---
@@ -161,6 +163,38 @@ def is_prompt_safe(prompt: str) -> tuple[bool, str]:
             return False, "Potential prompt injection attempt detected."
 
     return True, ""
+
+
+ALLOWED_PROVIDERS = {"gemini", "groq"}
+
+
+def _parse_query_request(payload: dict[str, Any]) -> tuple[str, str, str | None, int, str | None]:
+    """Validate and normalize the shared /api/query* request payload."""
+    question = str(payload.get("question", "")).strip()
+    if not question:
+        raise ValidationError("Question is required.")
+
+    provider = str(payload.get("provider", "gemini")).strip().lower()
+    if provider not in ALLOWED_PROVIDERS:
+        raise ValidationError(f"provider must be one of {sorted(ALLOWED_PROVIDERS)}.")
+
+    api_key = payload.get("api_key") or None
+
+    try:
+        top_k = int(payload.get("top_k", settings.default_top_k))
+    except (TypeError, ValueError):
+        top_k = settings.default_top_k
+    top_k = max(1, min(top_k, 10))
+
+    raw_override = payload.get("sql_override")
+    if raw_override is None:
+        sql_override = None
+    elif isinstance(raw_override, str):
+        sql_override = raw_override.strip() or None
+    else:
+        sql_override = str(raw_override).strip() or None
+
+    return question, provider, api_key, top_k, sql_override
 
 
 def _format_result_df(df: pd.DataFrame | None, limit: int = 200) -> dict[str, Any] | None:
@@ -265,7 +299,7 @@ def _run_query(
     }
 
     final_state = state.copy()
-    status_updates: list[dict[str, str]] = []
+    status_updates: list[dict[str, Any]] = []
 
     try:
         for update in graph.stream(state, stream_mode="updates"):
@@ -314,7 +348,7 @@ def _run_sql_override(
     api_key: str | None,
 ) -> dict[str, Any]:
     start_time = time.perf_counter()
-    status_updates: list[dict[str, str]] = []
+    status_updates: list[dict[str, Any]] = []
 
     try:
         llm_client = load_llm_client(provider=provider, api_key=api_key)
@@ -336,12 +370,15 @@ def _run_sql_override(
             "elapsed_s": elapsed_s,
         })
 
+        judge_score = judge_response(question, sql_override, result_df, summary, llm_client) if settings.enable_llm_judge else None
+
         return {
             "query": question,
             "sql_query": sql_override,
             "db_result": result_df,
             "summary": summary,
             "figure": figure,
+            "judge_score": judge_score,
             "status": "completed",
             "schema_context": "",
             "status_updates": status_updates,
@@ -402,27 +439,27 @@ def index() -> Any:
     return send_from_directory(app.static_folder, "index.html")
 
 
+@app.route("/api/health")
+def api_health() -> Any:
+    """Liveness probe — returns 200 as long as the process is running."""
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/ready")
+def api_ready() -> Any:
+    """Readiness probe — verifies the database and schema index are usable."""
+    checks = {
+        "database": db.check_connection(str(DB_PATH)) if DB_PATH.exists() else False,
+        "schema_index_built": _assets_ready,
+    }
+    ready = all(checks.values())
+    return jsonify({"status": "ready" if ready else "not_ready", "checks": checks}), (200 if ready else 503)
+
+
 @app.route("/api/query", methods=["POST"])
 def api_query() -> Any:
     payload = request.get_json(silent=True) or {}
-    question = str(payload.get("question", "")).strip()
-    if not question:
-        return jsonify({"error": "Question is required."}), 400
-
-    provider = str(payload.get("provider", "gemini")).strip().lower()
-    api_key = payload.get("api_key") or None
-    try:
-        top_k = int(payload.get("top_k", 3))
-    except (TypeError, ValueError):
-        top_k = 3
-
-    raw_override = payload.get("sql_override")
-    if raw_override is None:
-        sql_override = None
-    elif isinstance(raw_override, str):
-        sql_override = raw_override.strip() or None
-    else:
-        sql_override = str(raw_override).strip() or None
+    question, provider, api_key, top_k, sql_override = _parse_query_request(payload)
 
     _ensure_assets_ready()
     if sql_override:
@@ -454,6 +491,7 @@ def api_query() -> Any:
         "figure": figure_json,
         "figures": figures_all,
         "chart_type_auto": result.get("chart_type", "table"),
+        "judge_score": result.get("judge_score"),
         "status_updates": status_updates,
         "schema_context": schema_context,
         "status_meta": status_meta,
@@ -468,18 +506,7 @@ def api_query() -> Any:
 def api_query_stream() -> Any:
     """SSE endpoint — streams LangGraph node updates as they happen."""
     payload = request.get_json(silent=True) or {}
-    question = str(payload.get("question", "")).strip()
-    if not question:
-        return jsonify({"error": "Question is required."}), 400
-
-    provider = str(payload.get("provider", "gemini")).strip().lower()
-    api_key = payload.get("api_key") or None
-    try:
-        top_k = int(payload.get("top_k", 3))
-    except (TypeError, ValueError):
-        top_k = 3
-
-    sql_override: str | None = None
+    question, provider, api_key, top_k, sql_override = _parse_query_request(payload)
 
     _ensure_assets_ready()
 
@@ -502,6 +529,7 @@ def api_query_stream() -> Any:
 
                 db_result = _format_result_df(result_df)
                 figures_all = _serialize_all_figures(result_df, question)
+                judge_score = judge_response(question, sql_override, result_df, summary, llm_client) if settings.enable_llm_judge else None
                 status_updates = [
                     {"node": "execute_sql", "message": STATUS_MESSAGES["execute_sql"], "elapsed_s": elapsed_s},
                     {"node": "generate_visual_and_summary", "message": STATUS_MESSAGES["generate_visual_and_summary"], "elapsed_s": elapsed_s},
@@ -515,6 +543,7 @@ def api_query_stream() -> Any:
                     "figure": _serialize_figure(figure),
                     "figures": figures_all,
                     "chart_type_auto": chart_type,
+                    "judge_score": judge_score,
                     "status_updates": status_updates,
                     "schema_context": "",
                     "status_meta": STATUS_MESSAGES["generate_visual_and_summary"],
@@ -560,7 +589,7 @@ def api_query_stream() -> Any:
 
                 if node_name == "self_correct":
                     retry_count = int(final_state.get("retry_count", 0))
-                    message = f"Error detected. Self-correcting (attempt {retry_count}/3)..."
+                    message = f"Error detected. Self-correcting (attempt {retry_count}/{settings.max_retry_count})..."
                 else:
                     message = STATUS_MESSAGES.get(node_name)
 
@@ -598,6 +627,7 @@ def api_query_stream() -> Any:
                 "figure": figure_json,
                 "figures": figures_all,
                 "chart_type_auto": final_state.get("chart_type", "table"),
+                "judge_score": final_state.get("judge_score"),
                 "status_updates": status_updates_list,
                 "schema_context": schema_context,
                 "status_meta": status_meta,
@@ -627,4 +657,4 @@ def static_files(filename: str) -> Any:
 
 if __name__ == "__main__":
     _ensure_assets_ready()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=False)
+    app.run(host=settings.host, port=settings.port, debug=settings.debug)

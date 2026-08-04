@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 import json
-import logging
-import sqlite3
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -11,26 +9,24 @@ from typing import Any
 import chromadb
 from rank_bm25 import BM25Okapi
 
+from . import db
+from .config import settings
+from .logging_utils import get_logger
+
 
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("USE_TF", "0")
 
 
-logger = logging.getLogger("RETRIEVER")
-if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+logger = get_logger("RETRIEVER")
 
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-DEFAULT_PERSIST_DIR = "chroma_store"
+EMBEDDING_MODEL_NAME = settings.embedding_model_name
+DEFAULT_PERSIST_DIR = settings.chroma_persist_dir
 MAX_JOIN_PATH_LENGTH = 4
 MAX_INTERMEDIATE_TABLES = 6
 MAX_JOIN_HINTS = 8
 
 _FK_GRAPH_CACHE: dict[str, dict[str, list[dict[str, str]]]] = {}
-
-
-def _read_only_uri(db_path: str) -> str:
-    return f"{Path(db_path).resolve().as_uri()}?mode=ro"
 
 
 @lru_cache(maxsize=1)
@@ -67,66 +63,63 @@ def _format_table_document(schema_doc: dict[str, Any]) -> str:
 def extract_schema(db_path: str) -> list[dict[str, Any]]:
     logger.info("Extracting schema from %s", db_path)
     schema_docs: list[dict[str, Any]] = []
-    connection: sqlite3.Connection | None = None
+    engine = db.get_read_only_engine(db_path)
     try:
-        connection = sqlite3.connect(_read_only_uri(db_path), uri=True)
-        connection.row_factory = sqlite3.Row
-        cursor = connection.cursor()
-        cursor.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-            ORDER BY name
-            """
-        )
-        table_names = [row[0] for row in cursor.fetchall()]
-
-        for table_name in table_names:
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            columns = [
-                {
-                    "name": row[1],
-                    "type": row[2],
-                    "notnull": bool(row[3]),
-                    "default": row[4],
-                    "primary_key": bool(row[5]),
-                }
-                for row in cursor.fetchall()
+        with engine.connect() as connection:
+            table_names = [
+                row[0]
+                for row in connection.exec_driver_sql(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                    ORDER BY name
+                    """
+                )
             ]
 
-            cursor.execute(f"PRAGMA foreign_key_list({table_name})")
-            foreign_keys = [
-                {
-                    "id": row[0],
-                    "seq": row[1],
-                    "table": row[2],
-                    "from": row[3],
-                    "to": row[4],
-                    "on_update": row[5],
-                    "on_delete": row[6],
-                    "match": row[7],
-                }
-                for row in cursor.fetchall()
-            ]
+            for table_name in table_names:
+                columns = [
+                    {
+                        "name": row._mapping["name"],
+                        "type": row._mapping["type"],
+                        "notnull": bool(row._mapping["notnull"]),
+                        "default": row._mapping["dflt_value"],
+                        "primary_key": bool(row._mapping["pk"]),
+                    }
+                    for row in connection.exec_driver_sql(f"PRAGMA table_info({table_name})")
+                ]
 
-            cursor.execute(f"SELECT * FROM {table_name} LIMIT 3")
-            sample_rows = [dict(row) for row in cursor.fetchall()]
-            schema_doc = {
-                "table_name": table_name,
-                "columns": columns,
-                "primary_key": [column["name"] for column in columns if column["primary_key"]],
-                "foreign_keys": foreign_keys,
-                "sample_rows": sample_rows,
-            }
-            schema_doc["document"] = _format_table_document(schema_doc)
-            schema_docs.append(schema_doc)
-    except sqlite3.Error as exc:
+                foreign_keys = [
+                    {
+                        "id": row._mapping["id"],
+                        "seq": row._mapping["seq"],
+                        "table": row._mapping["table"],
+                        "from": row._mapping["from"],
+                        "to": row._mapping["to"],
+                        "on_update": row._mapping["on_update"],
+                        "on_delete": row._mapping["on_delete"],
+                        "match": row._mapping["match"],
+                    }
+                    for row in connection.exec_driver_sql(f"PRAGMA foreign_key_list({table_name})")
+                ]
+
+                sample_rows = [
+                    dict(row._mapping)
+                    for row in connection.exec_driver_sql(f"SELECT * FROM {table_name} LIMIT 3")
+                ]
+                schema_doc = {
+                    "table_name": table_name,
+                    "columns": columns,
+                    "primary_key": [column["name"] for column in columns if column["primary_key"]],
+                    "foreign_keys": foreign_keys,
+                    "sample_rows": sample_rows,
+                }
+                schema_doc["document"] = _format_table_document(schema_doc)
+                schema_docs.append(schema_doc)
+    except Exception as exc:
         logger.error("Failed to extract schema: %s", exc)
         raise
-    finally:
-        if connection is not None:
-            connection.close()
 
     logger.info("Extracted %d schema documents", len(schema_docs))
     return schema_docs
@@ -282,13 +275,13 @@ def retrieve_relevant_schemas(
     corpus = all_docs_from_db.get("documents", [])
     tokenized_corpus = [doc.lower().split() for doc in corpus]
     bm25 = BM25Okapi(tokenized_corpus)
-    
+
     tokenized_query = query.lower().split()
     bm25_scores = bm25.get_scores(tokenized_query)
-    
+
     # Get top-k results for BM25
     top_bm25_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:top_k * 2]
-    
+
     bm25_results = {
         "ids": [[all_docs_from_db["ids"][i] for i in top_bm25_indices]],
         "scores": [[bm25_scores[i] for i in top_bm25_indices]]
@@ -311,9 +304,9 @@ def retrieve_relevant_schemas(
             if doc_id not in ranked_list:
                 ranked_list[doc_id] = 0
             ranked_list[doc_id] += 1 / (k + rank + 1)
-            
+
     sorted_fused_results = sorted(ranked_list.keys(), key=lambda x: ranked_list[x], reverse=True)
-    
+
     top_fused_ids = sorted_fused_results[:top_k]
 
     if not top_fused_ids:
@@ -336,14 +329,14 @@ def retrieve_relevant_schemas(
     max_score = max(ranked_list.values()) if ranked_list else 1.0
     top_scores = [ranked_list[doc_id] for doc_id in top_fused_ids]
     avg_confidence = (sum(top_scores) / len(top_scores)) / max_score if top_scores else 0.0
-    
+
     # Join path awareness
     retrieved_tables = [
         m.get("table_name")
         for m in metadatas
         if isinstance(m, dict) and m.get("table_name")
     ]
-    
+
     # Retrieve all metadatas to build the full schema graph
     try:
         all_elements = collection.get(include=["metadatas"])
@@ -360,7 +353,7 @@ def retrieve_relevant_schemas(
     if graph is None:
         graph = _build_fk_graph(all_metadatas)
         _FK_GRAPH_CACHE[collection_name] = graph
-    
+
     path_tables: set[str] = set()
     suggested_joins: set[str] = set()
 
@@ -389,7 +382,7 @@ def retrieve_relevant_schemas(
             MAX_INTERMEDIATE_TABLES,
         )
         intermediate_tables = set(sorted(intermediate_tables)[:MAX_INTERMEDIATE_TABLES])
-    
+
     int_docs: list[str] = []
     int_metadatas: list[dict[str, Any]] = []
     if intermediate_tables:
@@ -415,7 +408,7 @@ def retrieve_relevant_schemas(
         chunks.append(f"[Schema {idx} - Intermediate Join Path Table] {table_name}\n{int_doc}\n")
 
     context = "\n".join(chunks)
-    
+
     if suggested_joins:
         if len(suggested_joins) > MAX_JOIN_HINTS:
             logger.info(
