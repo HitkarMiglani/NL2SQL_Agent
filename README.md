@@ -17,7 +17,7 @@ NL2SQL Studio is an end-to-end natural-language-to-SQL system for a read-only SQ
 - An MCP server (`nl2sql_agent/mcp_server.py`) exposing the agent as tools (`ask_database`, `run_sql`, `list_tables`) for MCP-compatible clients.
 - GitHub Actions CI/CD: lint + unit tests on every push/PR, Docker build/push to GHCR on `main`.
 
-## Architecture Overview
+## Architecture
 
 1. **Schema Extraction + Indexing**
    - Extracts table schema, PK/FK info, and sample rows from SQLite.
