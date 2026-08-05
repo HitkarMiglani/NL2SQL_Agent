@@ -7,6 +7,7 @@ connection on every query.
 from __future__ import annotations
 
 import threading
+import re
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,13 @@ from .config import settings
 from .logging_utils import get_logger
 
 logger = get_logger("DB")
+
+SQL_QUERY_START_PATTERN = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+SQL_QUERY_FORBIDDEN_PATTERN = re.compile(
+    r"\b(attach|detach|pragma|alter|create|drop|update|insert|delete|replace|vacuum|reindex|analyze|truncate)\b",
+    re.IGNORECASE,
+)
+SQL_STRING_LITERAL_PATTERN = re.compile(r"'(?:''|[^'])*'")
 
 _engine_cache: dict[str, Engine] = {}
 _engine_cache_lock = threading.Lock()
@@ -55,9 +63,27 @@ def get_read_only_engine(db_path: str) -> Engine:
 
 def read_sql_query(sql: str, db_path: str) -> pd.DataFrame:
     """Execute a read-only SELECT/WITH query and return the result as a DataFrame."""
+    cleaned = sql.strip()
+    if not cleaned:
+        raise ValueError("SQL query is empty")
+    if not SQL_QUERY_START_PATTERN.match(cleaned):
+        raise ValueError("SQL query must start with SELECT or WITH")
+
+    without_literals = SQL_STRING_LITERAL_PATTERN.sub("''", cleaned)
+    if SQL_QUERY_FORBIDDEN_PATTERN.search(without_literals):
+        raise ValueError("Forbidden SQL operation detected")
+    if "--" in without_literals or "/*" in without_literals:
+        raise ValueError("SQL comments are not allowed")
+
+    normalized = without_literals.strip()
+    if ";" in normalized:
+        if not normalized.endswith(";") or normalized.count(";") > 1:
+            raise ValueError("Multiple SQL statements are not allowed")
+        cleaned = cleaned.rstrip().rstrip(";")
+
     engine = get_read_only_engine(db_path)
     with engine.connect() as connection:
-        return pd.read_sql_query(text(sql), connection)
+        return pd.read_sql_query(text(cleaned), connection)
 
 
 def fetch_rows(sql: str, db_path: str) -> list[dict[str, Any]]:
