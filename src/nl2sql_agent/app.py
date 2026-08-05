@@ -552,7 +552,7 @@ def api_query_stream() -> Any:
                     "status_meta": STATUS_MESSAGES["generate_visual_and_summary"],
                 }
                 yield f"data: {json.dumps(done_event)}\n\n"
-            except Exception as exc:
+            except Exception:
                 logger.error("SQL override execution failed", exc_info=True)
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Unable to run the query.'})}\n\n"
             return
@@ -566,7 +566,7 @@ def api_query_stream() -> Any:
                 llm_client=llm_client,
                 top_k=top_k,
             )
-        except Exception as exc:
+        except Exception:
             logger.error("Failed to build agent graph", exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'message': 'Unable to run the query.'})}\n\n"
             return
@@ -641,7 +641,7 @@ def api_query_stream() -> Any:
                 done_event.update(error_payload)
             yield f"data: {json.dumps(done_event)}\n\n"
 
-        except Exception as exc:
+        except Exception:
             logger.error("Stream query execution failed", exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'message': 'Unable to run the query.'})}\n\n"
 
