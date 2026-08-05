@@ -220,7 +220,10 @@ def _serialize_figure(figure: Any) -> dict[str, Any] | None:
     if figure is None:
         return None
     try:
-        return json.loads(pio.to_json(figure, validate=False))
+        json_str = pio.to_json(figure, validate=False)
+        if json_str is None:
+            return None
+        return json.loads(json_str)
     except Exception:
         return None
 
@@ -436,7 +439,7 @@ def _classify_error(
 
 @app.route("/")
 def index() -> Any:
-    return send_from_directory(app.static_folder, "index.html")
+    return send_from_directory(app.static_folder or "web", "index.html")
 
 
 @app.route("/api/health")
@@ -550,7 +553,8 @@ def api_query_stream() -> Any:
                 }
                 yield f"data: {json.dumps(done_event)}\n\n"
             except Exception as exc:
-                yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+                logger.error("SQL override execution failed", exc_info=True)
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Unable to run the query.'})}\n\n"
             return
 
         # Agent path — stream each LangGraph node update
@@ -563,7 +567,8 @@ def api_query_stream() -> Any:
                 top_k=top_k,
             )
         except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            logger.error("Failed to build agent graph", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Unable to run the query.'})}\n\n"
             return
 
         state: dict[str, Any] = {
@@ -637,7 +642,8 @@ def api_query_stream() -> Any:
             yield f"data: {json.dumps(done_event)}\n\n"
 
         except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Unable to run the query: {exc}'})}\n\n"
+            logger.error("Stream query execution failed", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Unable to run the query.'})}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -652,7 +658,7 @@ def api_query_stream() -> Any:
 
 @app.route("/static/<path:filename>")
 def static_files(filename: str) -> Any:
-    return send_from_directory(app.static_folder, filename)
+    return send_from_directory(app.static_folder or "static", filename)
 
 
 if __name__ == "__main__":

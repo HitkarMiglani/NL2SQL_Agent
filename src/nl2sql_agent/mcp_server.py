@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from .agent import load_llm_client, run_agent
 from .app import DEFAULT_COLLECTION_NAME, _ensure_assets_ready, _execute_sql_direct, _format_result_df
