@@ -351,14 +351,25 @@ def _run_sql_override(
     status_updates: list[dict[str, Any]] = []
 
     try:
-        llm_client = load_llm_client(provider=provider, api_key=api_key)
-        result_df = _execute_sql_direct(str(DB_PATH), sql_override)
         elapsed_s = round(time.perf_counter() - start_time, 2)
         status_updates.append({
             "node": "execute_sql",
-            "message": STATUS_MESSAGES["execute_sql"],
+            "message": "Direct SQL override is disabled for security.",
             "elapsed_s": elapsed_s,
         })
+        return {
+            "question": question,
+            "sql_query": None,
+            "db_result": None,
+            "summary": None,
+            "chart_spec": None,
+            "judge": None,
+            "status_updates": status_updates,
+            "error": {
+                "type": "validation_error",
+                "message": "SQL override is disabled for security reasons.",
+            },
+        }
 
         chart_type = select_chart_type(result_df)
         figure = generate_plotly_chart(result_df, chart_type, question)
